@@ -46,6 +46,13 @@ const CONFIG = {
   IDLE_RESET: 30,        // 操作がないとタイトルに戻るまで（秒）
   RESULT_WAIT: 2,        // 結果画面で次のゲームを始められるまで（秒）
   RESULT_TIMEOUT: 15,    // 結果画面から自動でタイトルに戻るまで（秒）
+  // 結果画面の評価コメント：[この点数以上, 日本語, 英語]。点数の低い順に並べ、先頭は必ず 0 にする
+  RANKS: [
+    [0, "レモンがすっぱい…", "Too sour..."],
+    [20, "おなかいっぱい", "Nice and full"],
+    [35, "オムライス名人", "Omurice master"],
+    [51, "伝説のいたち君！", "Legendary!"],
+  ],
   DEBUG: false           // 展示版では false にする（D キーで残り10秒へ）
 };
 // ==================================================================
@@ -472,12 +479,16 @@ function drawTitle() {
 }
 
 function drawResult() {
-  panel(150, 120, 340, 190);
-  text("ごちそうさま / FINISH", W / 2, 158, 28, "#fff");
-  drawOmurice(W / 2 - 55, 222, 0, 1, false, 1.5);
-  text("× " + score, W / 2 + 35, 222, 44, "#ffe14a");
+  panel(150, 105, 340, 240);
+  text("ごちそうさま / FINISH", W / 2, 136, 28, "#fff");
+  drawOmurice(W / 2 - 55, 206, 0, 1, false, 1.5);
+  text("× " + score, W / 2 + 35, 206, 44, "#ffe14a");
+  const rank = CONFIG.RANKS.filter(r => score >= r[0]).pop() || CONFIG.RANKS[0];
+  const top = rank === CONFIG.RANKS[CONFIG.RANKS.length - 1];
+  text(rank[1], W / 2, 256, 26, top ? "#ffe14a" : "#fff");
+  text(rank[2], W / 2, 284, 16, "#ddd");
   if (resultT > CONFIG.RESULT_WAIT && Math.floor(performance.now() / 500) % 2 === 0) {
-    text("タッチでもう一回 / Tap to play again", W / 2, 282, 16, "#fff");
+    text("タッチでもう一回 / Tap to play again", W / 2, 322, 16, "#fff");
   }
 }
 
