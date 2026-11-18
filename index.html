@@ -462,7 +462,7 @@ function drawTitle() {
 function drawResult() {
   panel(150, 105, 340, 240);
   text("ごちそうさま / FINISH", W / 2, 136, 28, "#fff");
-  drawHeroSprite("happy", W / 2 - 60, 238, 0.42, 0);
+  drawHeroSprite("happy", W / 2 - 78, 238, 0.42, 0);
   drawOmurice(W / 2 + 2, 196, 0, 1, false, 1);
   text("× " + score, W / 2 + 34, 196, 40, "#ffe14a", "left");
   const rank = CONFIG.RANKS.filter(r => score >= r[0]).pop() || CONFIG.RANKS[0];
