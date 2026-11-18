@@ -1,0 +1,518 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>オムライス好きのいたち君</title>
+<style>
+  html, body {
+    margin: 0; height: 100%; background: #000; overflow: hidden;
+    user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+    touch-action: none; overscroll-behavior: none;
+  }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; image-rendering: pixelated; image-rendering: crisp-edges; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c" width="640" height="480"></canvas>
+<script>
+"use strict";
+
+// ================= 調整用の値（ここだけ触ればOK） =================
+// 難しさのねらい：100人が1回ずつ遊んで、50点を超える（51点以上）のは約1人（2026-11-18 自動プレイで調整。オムライスは1回に約62個）
+const CONFIG = {
+  GAME_TIME: 60,         // 1回の時間（秒）
+  LIVES: 3,              // レモンを何個取ったら終わりか
+  PLAYER_FOLLOW: 0.35,   // いたち君がマウス・指に追いつく速さ（0〜1。大きいほど速い）
+  PLAYER_KEY_SPEED: 10,  // ←→キーで動く速さ（px/フレーム）
+  FALL_SPEED_MIN: 3.0,   // 落ちる速さ・最小（px/フレーム）
+  FALL_SPEED_MAX: 4.5,   // 落ちる速さ・最大
+  FALL_SPEED_END: 1.5,   // 終了時には落ちる速さが何倍になるか（1なら変わらない）
+  SPAWN_START: 28,       // 出てくる間隔・開始時（フレーム。30で1秒）。もとは 32
+  SPAWN_END: 14,         // 出てくる間隔・終了時
+  LEMON_RATIO: 0.3,      // レモンが混ざる割合（0〜1）。もとは 0.35
+  LEMON_TIP: 4,          // レモンの両端のとがり（px。0でオムライスと同じ輪郭、試作1は約9）
+  OMURICE_TIP: 0,        // オムライスの両端のとがり（px。0で丸い）
+  FLIP_START: 0.35,      // 「回る」ものが出始める時点（0＝最初から、1＝最後。0.35なら約21秒後）
+  FLIP_RATIO: 0.6,       // 回り始めてから、回るものの割合（0〜1）
+  FLIP_Y_MIN: 120,       // 回る高さ・いちばん上（画面の上からpx。湯気より上なら湯気の下ふちから）
+  FLIP_Y_MAX: 340,       // 回る高さ・いちばん下（いたち君の頭は約385）
+  FLIP_FRAMES: 10,       // 回りきるまでのフレーム数
+  STEAM_START: 30,       // 湯気の下のふち・開始時（画面の上からpx）
+  STEAM_END: 280,        // 湯気の下のふち・終了時
+  PUFF_START: 4,         // 鍋がボワッと湯気を出す間隔・開始時（秒）
+  PUFF_END: 1.5,         // 同・終了時（秒）
+  IDLE_RESET: 30,        // 操作がないとタイトルに戻るまで（秒）
+  RESULT_WAIT: 2,        // 結果画面で次のゲームを始められるまで（秒）
+  RESULT_TIMEOUT: 15,    // 結果画面から自動でタイトルに戻るまで（秒）
+  DEBUG: false           // 展示版では false にする（D キーで残り10秒へ）
+};
+// ==================================================================
+
+const W = 640, H = 480, FPS = 30, STEP = 1000 / FPS;
+const GROUND = 440;              // いたち君の足もと
+const CATCH_Y = GROUND - 56;     // いたち君の頭（受け止める高さ）
+const PLAYER_HALF = 26;          // 受け止める幅の半分
+const POT = { x: 540, y: 300 };  // 奥のコンロの鍋（湯気の出どころ）
+
+const cv = document.getElementById("c");
+const ctx = cv.getContext("2d");
+
+// ---------- 画面サイズ：比率を保って拡大 ----------
+function fit() {
+  const s = Math.min(innerWidth / W, innerHeight / H);
+  cv.style.width = Math.floor(W * s) + "px";
+  cv.style.height = Math.floor(H * s) + "px";
+}
+addEventListener("resize", fit);
+fit();
+
+// ---------- 誤操作の封じ込め ----------
+["contextmenu", "selectstart", "dragstart", "gesturestart", "dblclick"].forEach(
+  (n) => addEventListener(n, (e) => e.preventDefault())
+);
+addEventListener("wheel", (e) => e.preventDefault(), { passive: false });
+addEventListener("touchmove", (e) => e.preventDefault(), { passive: false });
+
+// ---------- 状態 ----------
+let state, t, hero, items, popups, drops, puffs;
+let score, lives, spawnTimer, puffTimer, shake, hurtFlash, resultT;
+let pointerX = null, lastInput = performance.now();
+const keys = {};
+
+const lerp = (a, b, k) => a + (b - a) * k;
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const rand = (a, b) => a + Math.random() * (b - a);
+
+function resetWorld() {
+  t = 0; items = []; popups = []; drops = []; puffs = [];
+  score = 0; lives = CONFIG.LIVES; spawnTimer = 0; puffTimer = 0;
+  shake = 0; hurtFlash = 0; resultT = 0;
+  hero = { x: W / 2, vx: 0, hurt: 0, bounce: 0 };
+}
+function toTitle() { resetWorld(); state = "title"; }
+function startGame() { resetWorld(); state = "play"; lastInput = performance.now(); }
+function endGame() { state = "result"; resultT = 0; }
+
+// ゲームの進み具合 0〜1（タイトルのデモ中は後半の様子を見せる）
+function progress() { return state === "title" ? 0.5 : clamp(t / CONFIG.GAME_TIME, 0, 1); }
+function steamY() { return lerp(CONFIG.STEAM_START, CONFIG.STEAM_END, progress()); }
+
+// ---------- 入力 ----------
+function gameX(e) {
+  const r = cv.getBoundingClientRect();
+  return clamp(((e.clientX - r.left) / r.width) * W, 0, W);
+}
+function poke() { lastInput = performance.now(); }
+function press() {
+  if (state === "title") startGame();
+  else if (state === "result" && resultT > CONFIG.RESULT_WAIT) startGame();
+}
+addEventListener("pointermove", (e) => { pointerX = gameX(e); poke(); });
+addEventListener("pointerdown", (e) => { pointerX = gameX(e); poke(); press(); });
+addEventListener("keydown", (e) => {
+  keys[e.key] = true; poke();
+  if (e.key.startsWith("Arrow")) pointerX = null;
+  if (e.key === " " || e.key === "Enter") press();
+  if (CONFIG.DEBUG && (e.key === "d" || e.key === "D") && state === "play") {
+    t = Math.max(t, CONFIG.GAME_TIME - 10);
+  }
+});
+addEventListener("keyup", (e) => { keys[e.key] = false; });
+addEventListener("blur", () => { for (const k in keys) keys[k] = false; });
+
+// ---------- 更新 ----------
+// 回るもの：最初は裏向き。flipY の高さを過ぎると回って表になる。
+// オムライスの表＝ケチャップのハート、裏＝何も描いていない卵。レモンは表も裏もレモン。
+function spawnItem() {
+  const p = progress();
+  const lemon = Math.random() < CONFIG.LEMON_RATIO;
+  const flips = p >= CONFIG.FLIP_START && Math.random() < CONFIG.FLIP_RATIO;
+  const top = Math.max(CONFIG.FLIP_Y_MIN, steamY());
+  items.push({
+    x: rand(34, W - 34), y: -30,
+    vy: rand(CONFIG.FALL_SPEED_MIN, CONFIG.FALL_SPEED_MAX) * lerp(1, CONFIG.FALL_SPEED_END, p),
+    lemon, rot: rand(-0.15, 0.15), vr: rand(-0.02, 0.02),
+    flips, flipY: rand(Math.min(top, CONFIG.FLIP_Y_MAX), CONFIG.FLIP_Y_MAX),
+    angle: 0   // 回転の角度 0〜π（π で回りきり）
+  });
+}
+
+// 今、裏が見えているか
+function showingBack(it) { return it.flips && it.angle < Math.PI / 2; }
+
+function puffPot() {
+  shake = Math.max(shake, 2);
+  for (let i = 0; i < 7; i++) {
+    puffs.push({ x: POT.x + rand(-14, 14), y: POT.y, r: rand(10, 18), vy: rand(-3, -1.8), vx: rand(-0.8, 0.4) });
+  }
+}
+
+function addPopup(x, y, text, color) {
+  popups.push({ x, y, text, color, life: 24 });
+}
+
+function moveHero() {
+  const before = hero.x;
+  if (state === "title") {
+    // デモ：ハートが見えている、いちばん下のオムライスを追いかける
+    let target = null;
+    for (const it of items) {
+      if (!it.lemon && !showingBack(it) && it.y > steamY() - 10 && (!target || it.y > target.y)) target = it;
+    }
+    hero.x += ((target ? target.x : W / 2) - hero.x) * 0.12;
+  } else if (state === "play") {
+    const left = keys["ArrowLeft"], right = keys["ArrowRight"];
+    if (left || right) {
+      hero.x += (right ? 1 : 0) * CONFIG.PLAYER_KEY_SPEED - (left ? 1 : 0) * CONFIG.PLAYER_KEY_SPEED;
+    } else if (pointerX !== null) {
+      hero.x += (pointerX - hero.x) * CONFIG.PLAYER_FOLLOW;
+    }
+  }
+  hero.x = clamp(hero.x, PLAYER_HALF + 4, W - PLAYER_HALF - 4);
+  hero.vx = hero.x - before;
+}
+
+function update() {
+  const p = progress();
+
+  if (state === "play") {
+    t += 1 / FPS;
+    if (t >= CONFIG.GAME_TIME) endGame();
+    if (performance.now() - lastInput > CONFIG.IDLE_RESET * 1000) { toTitle(); return; }
+  } else if (state === "result") {
+    resultT += 1 / FPS;
+    if (resultT > CONFIG.RESULT_TIMEOUT) { toTitle(); return; }
+  }
+
+  if (state !== "result") {
+    spawnTimer--;
+    if (spawnTimer <= 0) {
+      spawnItem();
+      spawnTimer = Math.round(lerp(CONFIG.SPAWN_START, CONFIG.SPAWN_END, p));
+    }
+  }
+
+  puffTimer -= 1 / FPS;
+  if (puffTimer <= 0) {
+    puffPot();
+    puffTimer = lerp(CONFIG.PUFF_START, CONFIG.PUFF_END, p);
+  }
+
+  moveHero();
+
+  // 落下・回転・受け止め
+  for (let i = items.length - 1; i >= 0; i--) {
+    const it = items[i];
+    it.y += it.vy;
+    it.rot = clamp(it.rot + it.vr, -0.25, 0.25);
+    if (it.flips && it.y >= it.flipY && it.angle < Math.PI) {
+      it.angle = Math.min(Math.PI, it.angle + Math.PI / CONFIG.FLIP_FRAMES);
+    }
+    const caught =
+      state !== "result" &&
+      it.y + 12 >= CATCH_Y && it.y <= GROUND - 10 &&
+      Math.abs(it.x - hero.x) < PLAYER_HALF + 10;
+    if (caught) {
+      items.splice(i, 1);
+      if (it.lemon) {
+        addPopup(hero.x, CATCH_Y - 20, "✕", "#ff4a3d");
+        hero.hurt = 20; shake = 10; hurtFlash = 6;
+        if (state === "play") { lives--; if (lives <= 0) endGame(); }
+      } else {
+        addPopup(hero.x, CATCH_Y - 20, "+1", "#ffe14a");
+        hero.bounce = 6;
+        if (state === "play") score++;
+      }
+    } else if (it.y > H + 40) {
+      items.splice(i, 1);
+    }
+  }
+
+  // 演出（数を上限で抑える）
+  hero.bounce *= 0.7; if (hero.hurt > 0) hero.hurt--;
+  shake *= 0.85; if (hurtFlash > 0) hurtFlash--;
+
+  for (let i = popups.length - 1; i >= 0; i--) {
+    const q = popups[i]; q.y -= 1.5; if (--q.life <= 0) popups.splice(i, 1);
+  }
+  if (drops.length < 60) drops.push({ x: rand(0, W), y: steamY(), vy: rand(0.5, 1.4), life: rand(30, 70) });
+  for (let i = drops.length - 1; i >= 0; i--) {
+    const d = drops[i]; d.y += d.vy; d.x += Math.sin((d.y + d.life) * 0.05) * 0.4;
+    if (--d.life <= 0 || d.y > GROUND) drops.splice(i, 1);
+  }
+  if (puffs.length < 50 && Math.random() < 0.3) {
+    puffs.push({ x: POT.x + rand(-8, 8), y: POT.y, r: rand(7, 11), vy: rand(-1.4, -0.8), vx: rand(-0.4, 0.2) });
+  }
+  for (let i = puffs.length - 1; i >= 0; i--) {
+    const u = puffs[i]; u.y += u.vy; u.x += u.vx; u.r += 0.25;
+    if (u.y + u.r < -10 || puffs.length > 80) puffs.splice(i, 1);
+  }
+}
+
+// ---------- 描画 ----------
+const OUTLINE = "#6b4f1d";
+
+// ケチャップのハート
+function ketchupHeart() {
+  ctx.beginPath();
+  ctx.moveTo(0, 7);
+  ctx.bezierCurveTo(-12, -1, -7, -10, 0, -4);
+  ctx.bezierCurveTo(7, -10, 12, -1, 0, 7);
+  ctx.fillStyle = "#d8262b"; ctx.fill();
+  ctx.lineWidth = 1.5; ctx.strokeStyle = "#8f1215"; ctx.stroke();
+}
+
+// オムライスとレモンの共通の輪郭。違いは両端のとがり（tip）だけ
+function itemShape(tip) {
+  const R = 24, h = 15, k = 0.552;
+  const cx = -R + tip * 0.6 - tip;            // とがるほど、端の丸みが細くなる
+  const cy = h * k * Math.max(0, 1 - tip / 12);
+  ctx.beginPath();
+  ctx.moveTo(-R - tip, 0);
+  ctx.bezierCurveTo(cx, -cy, -R * k, -h, 0, -h);
+  ctx.bezierCurveTo(R * k, -h, -cx, -cy, R + tip, 0);
+  ctx.bezierCurveTo(-cx, cy, R * k, h, 0, h);
+  ctx.bezierCurveTo(-R * k, h, cx, cy, -R - tip, 0);
+  ctx.closePath();
+}
+
+// オムライス：両端が丸い。表はケチャップのハート、裏は卵だけ
+function drawOmurice(x, y, rot, sy, back, s) {
+  ctx.save(); ctx.translate(x, y); ctx.rotate(rot); ctx.scale(s, s * sy);
+  itemShape(CONFIG.OMURICE_TIP);
+  ctx.fillStyle = "#f3c443"; ctx.fill();
+  ctx.lineWidth = 2; ctx.strokeStyle = OUTLINE; ctx.stroke();
+  if (back) {
+    // 裏：卵の合わせ目
+    ctx.beginPath(); ctx.moveTo(-14, 3); ctx.quadraticCurveTo(0, 7, 14, 3);
+    ctx.strokeStyle = "#c9962a"; ctx.lineWidth = 2; ctx.stroke();
+  } else {
+    ctx.beginPath(); ctx.ellipse(-9, -6, 7, 3, -0.3, 0, Math.PI * 2);
+    ctx.fillStyle = "#fbe08a"; ctx.fill();
+    ketchupHeart();
+  }
+  ctx.restore();
+}
+
+// レモン：両端がとがっている
+function drawLemon(x, y, rot, sy, back, s) {
+  ctx.save(); ctx.translate(x, y); ctx.rotate(rot); ctx.scale(s, s * sy);
+  itemShape(CONFIG.LEMON_TIP);
+  ctx.fillStyle = "#f5d33c"; ctx.fill();
+  ctx.lineWidth = 2; ctx.strokeStyle = OUTLINE; ctx.stroke();
+  if (back) {
+    ctx.fillStyle = "#c9a42a";
+    for (const [dx, dy] of [[-8, 2], [3, -4], [9, 5], [-2, 7]]) ctx.fillRect(dx, dy, 2, 2);
+  } else {
+    ctx.beginPath(); ctx.ellipse(-8, -6, 7, 3, -0.3, 0, Math.PI * 2);
+    ctx.fillStyle = "#fcec8e"; ctx.fill();
+  }
+  ctx.restore();
+}
+
+function drawItem(it, s) {
+  const sy = Math.max(0.08, Math.abs(Math.cos(it.angle)));
+  const back = showingBack(it);
+  if (it.lemon) drawLemon(it.x, it.y, it.rot, sy, back, s);
+  else drawOmurice(it.x, it.y, it.rot, sy, back, s);
+}
+
+// いたち君（正面・白い冬毛、しっぽの先だけ黒い）
+function drawHero(x) {
+  const by = GROUND - hero.bounce;
+  const hurtBlink = hero.hurt > 0 && Math.floor(hero.hurt / 3) % 2 === 0;
+  const fur = hurtBlink ? "#ffb3ad" : "#fbfaf6";
+  const line = "#2a2826";
+  const lean = clamp(hero.vx * 0.02, -0.2, 0.2);
+  // 足もとの影
+  ctx.beginPath(); ctx.ellipse(x, GROUND, 26, 6, 0, 0, Math.PI * 2);
+  ctx.fillStyle = "rgba(0,0,0,0.45)"; ctx.fill();
+  ctx.save(); ctx.translate(x, by); ctx.rotate(lean);
+  ctx.lineWidth = 3; ctx.strokeStyle = line;
+  // しっぽ
+  ctx.beginPath(); ctx.moveTo(12, -12);
+  ctx.quadraticCurveTo(38, -10, 36, -36);
+  ctx.lineWidth = 11; ctx.strokeStyle = line; ctx.stroke();
+  ctx.lineWidth = 6; ctx.strokeStyle = fur; ctx.stroke();
+  ctx.beginPath(); ctx.arc(36, -38, 5, 0, Math.PI * 2); ctx.fillStyle = "#1b1b1f"; ctx.fill();
+  ctx.lineWidth = 3; ctx.strokeStyle = line;
+  // 足
+  ctx.fillStyle = fur;
+  ctx.beginPath(); ctx.ellipse(-9, -3, 7, 4, 0, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+  ctx.beginPath(); ctx.ellipse(9, -3, 7, 4, 0, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+  // 胴（細長い）
+  ctx.beginPath(); ctx.ellipse(0, -22, 14, 20, 0, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+  ctx.beginPath(); ctx.ellipse(0, -20, 8, 13, 0, 0, Math.PI * 2); ctx.fillStyle = "#f1ece0"; ctx.fill();
+  // 耳
+  ctx.fillStyle = fur;
+  ctx.beginPath(); ctx.arc(-12, -55, 6, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+  ctx.beginPath(); ctx.arc(12, -55, 6, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+  ctx.fillStyle = "#f2b8b8";
+  ctx.beginPath(); ctx.arc(-12, -55, 3, 0, Math.PI * 2); ctx.arc(12, -55, 3, 0, Math.PI * 2); ctx.fill();
+  // 頭
+  ctx.fillStyle = fur;
+  ctx.beginPath(); ctx.ellipse(0, -45, 17, 13, 0, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+  // 目
+  ctx.fillStyle = "#111";
+  ctx.beginPath(); ctx.arc(-7, -47, 2.8, 0, Math.PI * 2); ctx.arc(7, -47, 2.8, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = "#fff";
+  ctx.fillRect(-8, -49, 1.5, 1.5); ctx.fillRect(6, -49, 1.5, 1.5);
+  // 鼻
+  ctx.beginPath(); ctx.moveTo(-3, -42); ctx.lineTo(3, -42); ctx.lineTo(0, -39); ctx.closePath();
+  ctx.fillStyle = "#e07a86"; ctx.fill();
+  // 口（取った直後は開く）
+  if (hero.bounce > 1) {
+    ctx.beginPath(); ctx.arc(0, -37, 3.5, 0, Math.PI); ctx.fillStyle = "#c94a4a"; ctx.fill();
+  }
+  ctx.restore();
+}
+
+function heart(x, y, on) {
+  ctx.save(); ctx.translate(x, y);
+  ctx.beginPath();
+  ctx.moveTo(0, 6);
+  ctx.bezierCurveTo(-10, -2, -6, -10, 0, -4);
+  ctx.bezierCurveTo(6, -10, 10, -2, 0, 6);
+  ctx.fillStyle = on ? "#ff5a5a" : "#55504c"; ctx.fill();
+  ctx.lineWidth = 2; ctx.strokeStyle = "#fff"; ctx.stroke();
+  ctx.restore();
+}
+
+function text(str, x, y, size, color, align) {
+  ctx.font = `bold ${size}px "Hiragino Kaku Gothic ProN","Yu Gothic UI","Meiryo",sans-serif`;
+  ctx.textAlign = align || "center"; ctx.textBaseline = "middle";
+  ctx.lineWidth = Math.max(3, size / 6); ctx.strokeStyle = "#000"; ctx.strokeText(str, x, y);
+  ctx.fillStyle = color; ctx.fillText(str, x, y);
+}
+
+// 洋食屋の厨房（固定部分は一度だけ描いておく）
+const bg = document.createElement("canvas");
+bg.width = W; bg.height = H;
+(function paintKitchen() {
+  const b = bg.getContext("2d");
+  // 壁：クリーム色のタイル
+  b.fillStyle = "#efe6d2"; b.fillRect(0, 0, W, 330);
+  b.strokeStyle = "#d9cdb3"; b.lineWidth = 1;
+  for (let y = 0; y < 330; y += 24) { b.beginPath(); b.moveTo(0, y + 0.5); b.lineTo(W, y + 0.5); b.stroke(); }
+  for (let x = 0; x < W; x += 24) { b.beginPath(); b.moveTo(x + 0.5, 0); b.lineTo(x + 0.5, 330); b.stroke(); }
+  // 棚とケチャップ・マスタード
+  b.fillStyle = "#8a5a34"; b.fillRect(40, 236, 220, 8);
+  const bottle = (x, col, cap) => {
+    b.fillStyle = col; b.fillRect(x, 202, 18, 34);
+    b.fillStyle = cap; b.fillRect(x + 5, 192, 8, 10);
+  };
+  bottle(60, "#d8262b", "#f2f2f2"); bottle(90, "#d8262b", "#f2f2f2"); bottle(120, "#e9b52a", "#f2f2f2");
+  b.fillStyle = "#f7f4ec"; b.fillRect(160, 214, 40, 22); b.fillRect(205, 214, 40, 22);  // 重ねた皿
+  b.strokeStyle = "#bdb4a2"; b.strokeRect(160.5, 214.5, 40, 22); b.strokeRect(205.5, 214.5, 40, 22);
+  // 吊るしたフライパン
+  b.fillStyle = "#444"; b.fillRect(330, 0, 3, 120); b.fillRect(400, 0, 3, 100);
+  b.beginPath(); b.arc(331, 150, 30, 0, Math.PI * 2); b.fillStyle = "#3a3a3d"; b.fill();
+  b.beginPath(); b.arc(401, 128, 24, 0, Math.PI * 2); b.fill();
+  // 奥のステンレス台とコンロの鍋
+  b.fillStyle = "#c3c8cd"; b.fillRect(0, 330, W, 14);
+  b.fillStyle = "#9aa1a8"; b.fillRect(0, 344, W, 36);
+  b.fillStyle = "#7d858d"; for (let x = 20; x < W; x += 120) b.fillRect(x, 352, 70, 4);
+  b.fillStyle = "#5c6168"; b.fillRect(POT.x - 36, POT.y, 72, 30);
+  b.fillStyle = "#73787f"; b.fillRect(POT.x - 40, POT.y - 4, 80, 6);
+  // 床：白黒のチェック
+  for (let y = 380, row = 0; y < H; y += 20, row++) {
+    for (let x = 0, col = 0; x < W; x += 20, col++) {
+      b.fillStyle = (row + col) % 2 ? "#26221f" : "#8a2f28";
+      b.fillRect(x, y, 20, 20);
+    }
+  }
+})();
+
+function drawBackground(p) {
+  ctx.drawImage(bg, 0, 0);
+  for (const u of puffs) {
+    ctx.beginPath(); ctx.arc(u.x, u.y, u.r, 0, Math.PI * 2);
+    ctx.fillStyle = "rgba(255,255,255,0.7)"; ctx.fill();
+  }
+  // 湯気で全体が少しずつ白っぽくなる
+  ctx.fillStyle = `rgba(255,255,255,${p * 0.18})`; ctx.fillRect(0, 0, W, H);
+}
+
+function drawSteam() {
+  const y = steamY(), k = performance.now() * 0.002;
+  ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(W, 0); ctx.lineTo(W, y);
+  for (let x = W; x >= 0; x -= 16) ctx.lineTo(x, y + Math.sin(x * 0.04 + k) * 7 + Math.sin(x * 0.11 - k) * 4);
+  ctx.closePath();
+  ctx.fillStyle = "#f2f0ec"; ctx.fill();
+  ctx.fillStyle = "rgba(255,255,255,0.85)";
+  for (const d of drops) { ctx.beginPath(); ctx.arc(d.x, d.y, 2.5, 0, Math.PI * 2); ctx.fill(); }
+}
+
+function drawHUD() {
+  drawOmurice(30, 28, 0, 1, false, 0.7);
+  text("× " + score, 54, 28, 22, "#fff", "left");
+  const remain = Math.max(0, Math.ceil(CONFIG.GAME_TIME - t));
+  text(String(remain), W - 24, 28, 26, remain <= 10 ? "#ffb84a" : "#fff", "right");
+  for (let i = 0; i < CONFIG.LIVES; i++) heart(W / 2 - (CONFIG.LIVES - 1) * 14 + i * 28, 28, i < lives);
+}
+
+function panel(x, y, w, h) {
+  ctx.fillStyle = "rgba(0,0,0,0.6)"; ctx.fillRect(x, y, w, h);
+  ctx.strokeStyle = "#fff"; ctx.lineWidth = 2; ctx.strokeRect(x + 1, y + 1, w - 2, h - 2);
+}
+
+function drawTitle() {
+  panel(110, 105, 420, 225);
+  text("オムライス好きのいたち君", W / 2, 140, 32, "#fff");
+  text("OMURICE-LOVING WEASEL", W / 2, 172, 16, "#ddd");
+  drawOmurice(245, 218, 0, 1, false, 1); text("○", 290, 218, 30, "#ffe14a");
+  drawLemon(370, 218, 0, 1, false, 1);   text("✕", 412, 218, 30, "#ff4a3d");
+  text("オムライス", 245, 250, 16, "#fff"); text("OMURICE", 245, 268, 12, "#ddd");
+  text("レモン", 370, 250, 16, "#fff");     text("LEMON", 370, 268, 12, "#ddd");
+  if (Math.floor(performance.now() / 500) % 2 === 0) {
+    text("タッチでスタート / Tap to start", W / 2, 305, 18, "#fff");
+  }
+}
+
+function drawResult() {
+  panel(150, 120, 340, 190);
+  text("ごちそうさま / FINISH", W / 2, 158, 28, "#fff");
+  drawOmurice(W / 2 - 55, 222, 0, 1, false, 1.5);
+  text("× " + score, W / 2 + 35, 222, 44, "#ffe14a");
+  if (resultT > CONFIG.RESULT_WAIT && Math.floor(performance.now() / 500) % 2 === 0) {
+    text("タッチでもう一回 / Tap to play again", W / 2, 282, 16, "#fff");
+  }
+}
+
+function draw() {
+  ctx.save();
+  if (shake > 0.5) ctx.translate(rand(-shake, shake), rand(-shake, shake));
+  drawBackground(progress());
+  for (const it of items) drawItem(it, 1);
+  drawHero(hero.x);
+  drawSteam();
+  for (const q of popups) text(q.text, q.x, q.y, 26, q.color);
+  ctx.restore();
+
+  if (hurtFlash > 0) { ctx.fillStyle = `rgba(255,40,30,${hurtFlash * 0.05})`; ctx.fillRect(0, 0, W, H); }
+  if (state === "title") drawTitle();
+  else { drawHUD(); if (state === "result") drawResult(); }
+  if (CONFIG.DEBUG) text("DEBUG", W - 8, H - 12, 12, "#f0f", "right");
+}
+
+// ---------- ループ（30FPS固定・エラーが出ても最初から） ----------
+let acc = 0, last = null;
+function loop(ts) {
+  requestAnimationFrame(loop);
+  if (last === null) last = ts;
+  acc += clamp(ts - last, 0, 250); last = ts;
+  try {
+    while (acc >= STEP) { update(); acc -= STEP; }
+    draw();
+  } catch (err) {
+    console.error(err);
+    acc = 0; toTitle();
+  }
+}
+toTitle();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
